@@ -307,3 +307,100 @@ test("a 3xx answer from an injected fetch is refused for token and MCP requests"
   assert.equal(redirectOpt, "error");
   await assert.rejects(new McpClient("https://www.perplexity.ai/mcp", async () => "TOK", f).callTool("x", {}), (e: Error) => /redirect/i.test(e.message) && !/TOK/.test(e.message));
 });
+
+async function redirectingOrigin(status: number) {
+  const hits: string[] = [];
+  const target = createServer((req, res) => {
+    hits.push("target");
+    req.resume();
+    res.end("{}");
+  });
+  await new Promise<void>((r) => target.listen(0, "127.0.0.1", r));
+  const tport = (target.address() as any).port;
+  const origin = createServer((req, res) => {
+    hits.push("origin " + req.method + " " + req.url);
+    req.resume();
+    res.statusCode = status;
+    res.setHeader("location", `http://127.0.0.1:${tport}/steal`);
+    res.end();
+  });
+  await new Promise<void>((r) => origin.listen(0, "127.0.0.1", r));
+  const host = `127.0.0.1:${(origin.address() as any).port}`;
+  const close = () => {
+    for (const s of [target, origin]) {
+      s.close();
+      s.closeAllConnections?.();
+    }
+  };
+  return { hits, host, close };
+}
+
+for (const status of [307, 308]) {
+  test(`MCP call answered with ${status} is refused and never re-sent`, async () => {
+    const o = await redirectingOrigin(status);
+    try {
+      await assert.rejects(new McpClient(`http://${o.host}/mcp`, async () => "TSECRET").callTool("x", {}), (e: Error) => /redirect/i.test(e.message) && !/TSECRET/.test(e.message));
+      assert.equal(o.hits.length, 1);
+      assert.ok(o.hits[0].startsWith("origin"));
+    } finally {
+      o.close();
+    }
+  });
+
+  test(`login token exchange answered with ${status} is refused and never re-sent`, async () => {
+    const o = await redirectingOrigin(status);
+    const dir = mkdtempSync(join(tmpdir(), "pplx-"));
+    const f = (async (u: string, init: any) => {
+      if (String(u).includes("well-known")) return new Response(JSON.stringify({ registration_endpoint: "http://r", authorization_endpoint: "http://a/auth", token_endpoint: `http://${o.host}/token` }));
+      if (String(u) === "http://r") return new Response(JSON.stringify({ client_id: "cid" }));
+      return fetch(u, init);
+    }) as unknown as typeof fetch;
+    try {
+      await assert.rejects(
+        login({ fetchImpl: f, path: join(dir, "c.json"), print: () => {}, mcpUrl: `http://${o.host}/mcp`, waitForCode: async (a) => new URL(`http://127.0.0.1/callback?code=CSECRET&state=${a.searchParams.get("state")}`) }),
+        (e: Error) => /redirect/i.test(e.message) && !/CSECRET/.test(e.message),
+      );
+      assert.equal(o.hits.length, 1);
+      assert.ok(o.hits[0].startsWith("origin"));
+    } finally {
+      o.close();
+    }
+  });
+
+  test(`login discovery and registration answered with ${status} are refused`, async () => {
+    const o = await redirectingOrigin(status);
+    const dir = mkdtempSync(join(tmpdir(), "pplx-"));
+    const quiet = { print: () => {}, path: join(dir, "c.json") };
+    try {
+      const discovery = (async (u: string, init: any) => fetch(`http://${o.host}/meta`, init)) as unknown as typeof fetch;
+      await assert.rejects(login({ ...quiet, fetchImpl: discovery }), /redirect/i);
+      const reg = (async (u: string, init: any) =>
+        String(u).includes("well-known")
+          ? new Response(JSON.stringify({ registration_endpoint: `http://${o.host}/register`, authorization_endpoint: "http://a/auth", token_endpoint: "https://www.perplexity.ai/token" }))
+          : fetch(u, init)) as unknown as typeof fetch;
+      await assert.rejects(login({ ...quiet, fetchImpl: reg }), /redirect/i);
+      assert.equal(o.hits.length, 2);
+      assert.ok(o.hits.every((h) => h.startsWith("origin")));
+    } finally {
+      o.close();
+    }
+  });
+}
+
+test("login refuses a discovered token_endpoint on another host before posting the code", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "pplx-"));
+  for (const te of ["https://evil.example/token", "http://evil.example/token", "http://www.perplexity.ai/token", "not a url"]) {
+    const posted: string[] = [];
+    const f = (async (u: string, init: any) => {
+      if (String(u).includes("well-known")) return new Response(JSON.stringify({ registration_endpoint: "http://r", authorization_endpoint: "http://a/auth", token_endpoint: te }));
+      if (String(u) === "http://r") return new Response(JSON.stringify({ client_id: "cid" }));
+      posted.push(String(u));
+      return new Response(JSON.stringify({ access_token: "tok" }));
+    }) as unknown as typeof fetch;
+    await assert.rejects(
+      login({ fetchImpl: f, path: join(dir, "c.json"), print: () => {}, waitForCode: async (a) => new URL(`http://127.0.0.1/callback?code=CSECRET&state=${a.searchParams.get("state")}`) }),
+      (e: Error) => /token endpoint/i.test(e.message) && !/CSECRET/.test(e.message),
+    );
+    assert.deepEqual(posted, []);
+  }
+});

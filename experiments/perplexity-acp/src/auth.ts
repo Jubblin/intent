@@ -162,9 +162,13 @@ export class TokenStore {
 }
 
 /** The refresh token is only posted to https (or loopback http) on the host the credentials were issued for or the default issuer. */
-function checkTokenEndpoint(raw: unknown, issuedFor: string) {
+function checkTokenEndpoint(raw: unknown, issuedFor: string, phase: "refresh" | "login" = "refresh") {
   const bad = () =>
-    new Error(`Refusing to refresh: the stored token endpoint is not trusted for ${issuedFor} (https on that host or ${DEFAULT_HOST} required). Run \`login\` again.`);
+    new Error(
+      phase === "refresh"
+        ? `Refusing to refresh: the stored token endpoint is not trusted for ${issuedFor} (https on that host or ${DEFAULT_HOST} required). Run \`login\` again.`
+        : `Refusing to sign in: the token endpoint from OAuth discovery is not trusted for ${issuedFor} (https on that host or ${DEFAULT_HOST} required).`,
+    );
   let u: URL;
   try {
     u = new URL(String(raw));
@@ -196,7 +200,7 @@ export async function login(
   const print = opts.print ?? ((s: string) => process.stderr.write(s + "\n"));
   const mcpUrl = validateMcpUrl(opts.mcpUrl ?? MCP_URL).href;
   const timeoutMs = opts.timeoutMs ?? (Number(process.env.PERPLEXITY_ACP_LOGIN_TIMEOUT_MS) || 300_000);
-  const metaRes = await f(ISSUER_META);
+  const metaRes = await noRedirectFetch(f, ISSUER_META);
   if (!metaRes.ok) throw new Error(`OAuth metadata request failed (HTTP ${metaRes.status}).`);
   const meta: any = await metaRes.json().catch(() => ({}));
   if (!meta.registration_endpoint || !meta.authorization_endpoint || !meta.token_endpoint) {
@@ -207,7 +211,7 @@ export async function login(
   const port = (server.address() as any).port;
   const redirect = `http://127.0.0.1:${port}/callback`;
   try {
-    const regRes = await f(meta.registration_endpoint, {
+    const regRes = await noRedirectFetch(f, meta.registration_endpoint, {
         method: "POST",
         headers: { "content-type": "application/json" },
         body: JSON.stringify({
@@ -258,6 +262,7 @@ export async function login(
     if (url.searchParams.get("state") !== state) throw new Error("State mismatch.");
     const code = url.searchParams.get("code");
     if (!code) throw new Error(`Authorization failed: ${url.searchParams.get("error") ?? "no code"}`);
+    checkTokenEndpoint(meta.token_endpoint, new URL(mcpUrl).host, "login");
     const tokRes = await noRedirectFetch(f, meta.token_endpoint, {
       method: "POST",
       headers: { "content-type": "application/x-www-form-urlencoded" },
