@@ -5,13 +5,15 @@ import { Peer } from "../src/jsonrpc.ts";
 
 type Call = { name: string; args: any };
 
-function harness(script: (call: Call, calls: Call[]) => any, permission: (p: any) => any = () => ({ outcome: { outcome: "selected", optionId: "approve" } })) {
+function harness(script: (call: Call, calls: Call[]) => any, permission: (p: any) => any = () => ({ outcome: { outcome: "selected", optionId: "approve" } }), agentOpts: any = {}, rawPermission?: (m: any, peer: Peer) => void) {
   const calls: Call[] = [];
   const out: any[] = [];
   const peer = new Peer((l) => {
     const m = JSON.parse(l);
     out.push(m);
-    if (m.method === "session/request_permission") {
+    if (m.method === "session/request_permission" && rawPermission) {
+      rawPermission(m, peer);
+    } else if (m.method === "session/request_permission") {
       setImmediate(() => peer.feed(JSON.stringify({ jsonrpc: "2.0", id: m.id, result: permission(m.params) }) + "\n"));
     }
   });
@@ -22,7 +24,7 @@ function harness(script: (call: Call, calls: Call[]) => any, permission: (p: any
       return script(c, calls);
     },
   };
-  new PerplexityAgent(peer, mcp, { pollMs: 1, cancelPolls: 2, hasCredentials: () => true });
+  new PerplexityAgent(peer, mcp, { pollMs: 1, cancelPolls: 2, hasCredentials: () => true, ...agentOpts });
   const send = (id: number, method: string, params: any = {}) => peer.feed(JSON.stringify({ jsonrpc: "2.0", id, method, params }) + "\n");
   const result = async (id: number) => {
     for (let i = 0; i < 200; i++) {
@@ -149,3 +151,23 @@ test("authenticate fails with login instructions when not signed in", async () =
   assert.match(out[0].error.message, /login/);
   void peer;
 });
+
+for (const [label, opts, raw] of [
+  ["errors", {}, (m: any, peer: Peer) => setImmediate(() => peer.feed(JSON.stringify({ jsonrpc: "2.0", id: m.id, error: { code: -1, message: "boom" } }) + "\n"))],
+  ["times out", { permissionTimeoutMs: 20 }, () => {}],
+] as const) {
+  test(`permission request that ${label} is a deny, cancels, and errors the prompt`, async () => {
+    const h = harness((c) => (c.name === "call_perplexity_computer" ? confirm : { event: "cancelled" }), undefined, opts, raw);
+    h.send(1, "session/new");
+    const sid = (await h.result(1)).result.sessionId;
+    h.send(2, "session/prompt", { sessionId: sid, prompt: [{ type: "text", text: "x" }] });
+    const r = await h.result(2);
+    assert.ok(r.error);
+    assert.match(r.error.message, /denied/);
+    const names = h.calls.map((c) => c.name);
+    assert.ok(!names.includes("confirm_action_approve"));
+    const deny = h.calls.find((c) => c.name === "confirm_action_deny")!;
+    assert.deepEqual([deny.args.thread_id, deny.args.followup_uuid], ["T", "call_1"]);
+    assert.ok(names.includes("cancel_task"));
+  });
+}

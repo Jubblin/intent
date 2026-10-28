@@ -1,5 +1,5 @@
 import { createHash, randomBytes } from "node:crypto";
-import { chmodSync, existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, readFileSync, renameSync, statSync, writeFileSync } from "node:fs";
 import { createServer } from "node:http";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
@@ -13,7 +13,24 @@ export type Credentials = {
   refreshToken?: string;
   expiresAt?: number;
   tokenEndpoint: string;
+  /** Host of the MCP server this token was issued for. Missing (older files) means the default host. */
+  mcpHost?: string;
 };
+
+const LOOPBACK = new Set(["localhost", "127.0.0.1", "::1", "[::1]"]);
+
+/** https only; http only for loopback hosts (tests, local mocks). Returns the parsed URL. */
+export function validateMcpUrl(raw: string): URL {
+  let u: URL;
+  try {
+    u = new URL(raw);
+  } catch {
+    throw new Error("PERPLEXITY_MCP_URL is not a valid URL.");
+  }
+  if (u.protocol === "https:") return u;
+  if (u.protocol === "http:" && LOOPBACK.has(u.hostname)) return u;
+  throw new Error("PERPLEXITY_MCP_URL must use https (http is allowed only for localhost, 127.0.0.1 or ::1).");
+}
 
 export function credentialsPath(): string {
   return (
@@ -31,8 +48,26 @@ export function saveCredentials(path: string, c: Credentials) {
   renameSync(tmp, path);
 }
 
+/** Tighten a group/world-accessible credentials file (0600) and its directory (0700), or refuse. Never reads contents. */
+function enforceModes(path: string) {
+  const fix = (p: string, want: number, what: string) => {
+    if ((statSync(p).mode & 0o077) === 0) return;
+    try {
+      chmodSync(p, want);
+    } catch {
+      throw new Error(`Credentials ${what} ${p} is accessible to other users and could not be tightened; fix its permissions.`);
+    }
+    if ((statSync(p).mode & 0o077) !== 0) {
+      throw new Error(`Credentials ${what} ${p} is accessible to other users and could not be tightened; fix its permissions.`);
+    }
+  };
+  fix(path, 0o600, "file");
+  fix(dirname(path), 0o700, "directory");
+}
+
 export function loadCredentials(path: string): Credentials | undefined {
   if (!existsSync(path)) return undefined;
+  enforceModes(path);
   return JSON.parse(readFileSync(path, "utf8"));
 }
 
@@ -45,10 +80,12 @@ export class TokenStore {
   private path: string;
   private fetchImpl: typeof fetch;
   private inflight?: Promise<string>;
+  private mcpHost: string;
 
-  constructor(path = credentialsPath(), fetchImpl: typeof fetch = fetch) {
+  constructor(path = credentialsPath(), fetchImpl: typeof fetch = fetch, mcpUrl: string = MCP_URL) {
     this.path = path;
     this.fetchImpl = fetchImpl;
+    this.mcpHost = validateMcpUrl(mcpUrl).host;
   }
 
   hasCredentials(): boolean {
@@ -68,6 +105,10 @@ export class TokenStore {
   private async resolve(force: boolean): Promise<string> {
     const c = loadCredentials(this.path);
     if (!c) throw new Error("Not signed in. Run `login` (browser step required).");
+    const issuedFor = c.mcpHost ?? new URL(MCP_URL).host;
+    if (issuedFor !== this.mcpHost) {
+      throw new Error(`Refusing to send the stored token to ${this.mcpHost}: it was issued for ${issuedFor}. Run \`login\` against that host or unset PERPLEXITY_MCP_URL.`);
+    }
     const fresh = c.expiresAt === undefined || c.expiresAt - Date.now() > 60_000;
     if (fresh && !force) return c.accessToken;
     if (!c.refreshToken) throw new Error("Access token expired and no refresh token. Run `login` again.");
@@ -103,18 +144,32 @@ const b64url = (b: Buffer) => b.toString("base64url");
  * loopback redirect. DCR redirect-URI rules for loopback are unverified against the live service.
  */
 export async function login(
-  opts: { path?: string; fetchImpl?: typeof fetch; print?: (s: string) => void; waitForCode?: (u: URL) => Promise<URL> } = {},
+  opts: {
+    path?: string;
+    fetchImpl?: typeof fetch;
+    print?: (s: string) => void;
+    waitForCode?: (u: URL) => Promise<URL>;
+    /** Max wait for the browser redirect. Default 300000 (env PERPLEXITY_ACP_LOGIN_TIMEOUT_MS). */
+    timeoutMs?: number;
+    mcpUrl?: string;
+  } = {},
 ): Promise<void> {
   const f = opts.fetchImpl ?? fetch;
   const print = opts.print ?? ((s: string) => process.stderr.write(s + "\n"));
-  const meta: any = await (await f(ISSUER_META)).json();
+  const mcpUrl = opts.mcpUrl ?? MCP_URL;
+  const timeoutMs = opts.timeoutMs ?? (Number(process.env.PERPLEXITY_ACP_LOGIN_TIMEOUT_MS) || 300_000);
+  const metaRes = await f(ISSUER_META);
+  if (!metaRes.ok) throw new Error(`OAuth metadata request failed (HTTP ${metaRes.status}).`);
+  const meta: any = await metaRes.json().catch(() => ({}));
+  if (!meta.registration_endpoint || !meta.authorization_endpoint || !meta.token_endpoint) {
+    throw new Error("OAuth metadata response is missing required endpoints.");
+  }
   const server = createServer();
   await new Promise<void>((r) => server.listen(0, "127.0.0.1", r));
   const port = (server.address() as any).port;
   const redirect = `http://127.0.0.1:${port}/callback`;
   try {
-    const reg: any = await (
-      await f(meta.registration_endpoint, {
+    const regRes = await f(meta.registration_endpoint, {
         method: "POST",
         headers: { "content-type": "application/json" },
         body: JSON.stringify({
@@ -124,8 +179,9 @@ export async function login(
           response_types: ["code"],
           token_endpoint_auth_method: "none",
         }),
-      })
-    ).json();
+    });
+    if (!regRes.ok) throw new Error(`Dynamic client registration failed (HTTP ${regRes.status}).`);
+    const reg: any = await regRes.json().catch(() => ({}));
     if (!reg.client_id) throw new Error("Dynamic client registration failed.");
     const verifier = b64url(randomBytes(32));
     const challenge = b64url(createHash("sha256").update(verifier).digest());
@@ -142,6 +198,10 @@ export async function login(
       resource: MCP_URL,
     }).toString();
     print(`Open this URL in a browser to sign in:\n${auth}`);
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const timeout = new Promise<never>((_, reject) => {
+      timer = setTimeout(() => reject(new Error(`Sign-in timed out after ${Math.round(timeoutMs / 1000)} s waiting for the browser redirect.`)), timeoutMs);
+    });
     const cb =
       opts.waitForCode?.(auth) ??
       new Promise<URL>((resolve) => {
@@ -151,7 +211,12 @@ export async function login(
           if (u.pathname === "/callback") resolve(u);
         });
       });
-    const url = await cb;
+    let url: URL;
+    try {
+      url = await Promise.race([cb, timeout]);
+    } finally {
+      clearTimeout(timer);
+    }
     if (url.searchParams.get("state") !== state) throw new Error("State mismatch.");
     const code = url.searchParams.get("code");
     if (!code) throw new Error(`Authorization failed: ${url.searchParams.get("error") ?? "no code"}`);
@@ -175,9 +240,11 @@ export async function login(
       refreshToken: tok.refresh_token,
       expiresAt: tok.expires_in ? Date.now() + tok.expires_in * 1000 : undefined,
       tokenEndpoint: meta.token_endpoint,
+      mcpHost: new URL(mcpUrl).host,
     });
     print("Signed in. Credentials saved (mode 0600).");
   } finally {
     server.close();
+    server.closeAllConnections?.();
   }
 }

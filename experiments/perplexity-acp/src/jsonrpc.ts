@@ -45,10 +45,22 @@ export class Peer {
     this.write(JSON.stringify({ jsonrpc: "2.0", method, params }));
   }
 
-  request<T = any>(method: string, params: Json): Promise<T> {
+  /** Optional timeoutMs rejects (and forgets the pending id) if no reply arrives; a late reply is ignored. */
+  request<T = any>(method: string, params: Json, timeoutMs?: number): Promise<T> {
     const id = this.nextId++;
     return new Promise<T>((resolve, reject) => {
-      this.pending.set(id, { resolve, reject });
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      const done = <A extends unknown[]>(fn: (...a: A) => void) => (...a: A) => {
+        if (timer) clearTimeout(timer);
+        fn(...a);
+      };
+      this.pending.set(id, { resolve: done(resolve), reject: done(reject) });
+      if (timeoutMs !== undefined && timeoutMs > 0) {
+        timer = setTimeout(() => {
+          this.pending.delete(id);
+          reject(new Error(`${method} timed out after ${timeoutMs} ms`));
+        }, timeoutMs);
+      }
       this.write(JSON.stringify({ jsonrpc: "2.0", id, method, params }));
     });
   }

@@ -13,7 +13,13 @@ npm run login          # one-time browser sign-in (OAuth code + PKCE, dynamic cl
 npm start              # ACP over stdio; point any ACP client at this command
 ```
 
-Credentials: `PERPLEXITY_ACCESS_TOKEN` (env, never refreshed) or `~/.config/perplexity-acp/credentials.json` (mode 0600, override with `PERPLEXITY_ACP_CREDENTIALS`). Tokens are never logged. Refresh is serialized in-process only (no cross-process lock). Optional: `PERPLEXITY_ACP_MODE` (e.g. `light`, `standard`, `high`), `PERPLEXITY_MCP_URL`.
+Credentials: `PERPLEXITY_ACCESS_TOKEN` (env, never refreshed) or `~/.config/perplexity-acp/credentials.json` (mode 0600, override with `PERPLEXITY_ACP_CREDENTIALS`). Tokens are never logged. Refresh is serialized in-process only (no cross-process lock). Optional: `PERPLEXITY_ACP_MODE` (e.g. `light`, `standard`, `high`).
+
+Hardening knobs:
+- `PERPLEXITY_ACP_PERMISSION_TIMEOUT_MS` (default 120000): how long to wait for the client's answer to a confirmation request. An error, rejection or timeout is treated as a **deny**: the deny is sent, the task is cancelled best-effort, and the prompt ends with an error. Nothing is ever approved on a failure path.
+- `PERPLEXITY_ACP_LOGIN_TIMEOUT_MS` (default 300000): how long `login` waits for the browser redirect before closing the loopback listener.
+- Credentials file/dir modes: on load, a group- or world-accessible credentials file is tightened to 0600 (directory 0700); if that fails the adapter refuses with an error.
+- `PERPLEXITY_MCP_URL` overrides the MCP endpoint. It must be `https`; `http` is accepted only for `localhost`, `127.0.0.1` or `::1`. A stored token is only sent to the host it was issued for (recorded at `login`; older files count as `www.perplexity.ai`); a different host is refused. `PERPLEXITY_ACCESS_TOKEN` (env) is your explicit choice and is not host-checked.
 
 Smoke test with a raw client:
 

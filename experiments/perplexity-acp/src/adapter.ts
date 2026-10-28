@@ -15,6 +15,8 @@ export type AdapterOptions = {
   mode?: string;
   hasCredentials?: () => boolean;
   cancelPolls?: number;
+  /** Max wait for the client's answer to session/request_permission; expiry is a DENY. Default 120000. */
+  permissionTimeoutMs?: number;
 };
 
 const TERMINAL = new Set(["completed", "cancelled", "failed", "error"]);
@@ -27,12 +29,12 @@ export class PerplexityAgent {
   private sessions = new Map<string, Session>();
   private peer: Peer;
   private mcp: Mcp;
-  private o: Required<Pick<AdapterOptions, "pollMs" | "cancelPolls">> & AdapterOptions;
+  private o: Required<Pick<AdapterOptions, "pollMs" | "cancelPolls" | "permissionTimeoutMs">> & AdapterOptions;
 
   constructor(peer: Peer, mcp: Mcp, opts: AdapterOptions = {}) {
     this.peer = peer;
     this.mcp = mcp;
-    this.o = { pollMs: 3000, cancelPolls: 5, ...opts };
+    this.o = { pollMs: 3000, cancelPolls: 5, permissionTimeoutMs: 120_000, ...opts };
     peer.onRequest("initialize", () => this.initialize());
     peer.onRequest("authenticate", () => this.authenticate());
     peer.onRequest("session/new", () => this.newSession());
@@ -158,7 +160,10 @@ export class PerplexityAgent {
   private async confirm(s: Session, i: any, text?: string): Promise<any> {
     const threadId = i.thread_id ?? s.threadId;
     const toolCallId = `confirm-${i.followup_uuid ?? randomUUID()}`;
-    const out = await this.peer.request("session/request_permission", {
+    const args: Record<string, unknown> = { thread_id: threadId, followup_uuid: i.followup_uuid };
+    let out: any;
+    try {
+      out = await this.peer.request("session/request_permission", {
       sessionId: s.id,
       toolCall: {
         toolCallId,
@@ -171,13 +176,21 @@ export class PerplexityAgent {
         { optionId: "approve", name: "Approve", kind: "allow_once" },
         { optionId: "deny", name: "Deny", kind: "reject_once" },
       ],
-    });
+      }, this.o.permissionTimeoutMs);
+    } catch (e: any) {
+      // Fail closed: an errored, rejected or timed-out permission request is a DENY, never an approval.
+      s.cancelled = true;
+      try {
+        await this.mcp.callTool(i.deny_with_tool ?? "confirm_action_deny", { ...args, result: "Denied: permission request failed or timed out" });
+      } catch {}
+      await this.backendCancel(s);
+      throw new RpcFailure(-32000, `Permission request failed (${e?.message ?? e}); the action was denied and the task cancelled.`);
+    }
     const selected = out?.outcome?.outcome === "selected" ? out.outcome.optionId : undefined;
     if (!selected || s.cancelled) {
       s.cancelled = true;
       return "cancelled";
     }
-    const args: Record<string, unknown> = { thread_id: threadId, followup_uuid: i.followup_uuid };
     if (selected === "approve") return this.mcp.callTool(i.approve_with_tool ?? "confirm_action_approve", args);
     return this.mcp.callTool(i.deny_with_tool ?? "confirm_action_deny", { ...args, result: "Denied by user in ACP client" });
   }

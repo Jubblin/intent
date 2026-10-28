@@ -1,10 +1,10 @@
 import assert from "node:assert/strict";
-import { mkdtempSync, statSync } from "node:fs";
+import { chmodSync, mkdtempSync, statSync } from "node:fs";
 import { createServer } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
-import { TokenStore, loadCredentials, saveCredentials } from "../src/auth.ts";
+import { TokenStore, login, loadCredentials, saveCredentials, validateMcpUrl } from "../src/auth.ts";
 import { McpClient } from "../src/mcp.ts";
 
 function mockMcp(handler: (tool: string, args: any, auth: string) => any, sse = false) {
@@ -86,4 +86,56 @@ test("invalid_grant asks for re-login without leaking tokens", async () => {
   saveCredentials(path, { clientId: "cid", accessToken: "SECRET", refreshToken: "RSECRET", expiresAt: 1, tokenEndpoint: "http://t" });
   const f = (async () => new Response(JSON.stringify({ error: "invalid_grant" }), { status: 400 })) as unknown as typeof fetch;
   await assert.rejects(new TokenStore(path, f).provider(), (e: Error) => /login/.test(e.message) && !/SECRET/.test(e.message));
+});
+
+test("loadCredentials tightens loose file and directory modes", () => {
+  const dir = mkdtempSync(join(tmpdir(), "pplx-"));
+  const path = join(dir, "c.json");
+  saveCredentials(path, { clientId: "c", accessToken: "SECRET", tokenEndpoint: "http://t" });
+  chmodSync(path, 0o644);
+  chmodSync(dir, 0o755);
+  assert.equal(loadCredentials(path)!.accessToken, "SECRET");
+  assert.equal(statSync(path).mode & 0o777, 0o600);
+  assert.equal(statSync(dir).mode & 0o777, 0o700);
+});
+
+test("validateMcpUrl: https ok, http only loopback, junk refused", () => {
+  validateMcpUrl("https://example.com/mcp");
+  validateMcpUrl("http://127.0.0.1:1/mcp");
+  validateMcpUrl("http://localhost/mcp");
+  assert.throws(() => validateMcpUrl("http://example.com/mcp"), /https/);
+  assert.throws(() => validateMcpUrl("ftp://example.com"), /https/);
+  assert.throws(() => validateMcpUrl("not a url"), /valid URL/);
+});
+
+test("stored token is not sent to a host it was not issued for", async () => {
+  delete process.env.PERPLEXITY_ACCESS_TOKEN;
+  const dir = mkdtempSync(join(tmpdir(), "pplx-"));
+  const path = join(dir, "c.json");
+  saveCredentials(path, { clientId: "c", accessToken: "SECRET", tokenEndpoint: "http://t", mcpHost: "www.perplexity.ai" });
+  await assert.rejects(new TokenStore(path, fetch, "https://evil.example/mcp").provider(), (e: Error) => /issued for/.test(e.message) && !/SECRET/.test(e.message));
+  assert.equal(await new TokenStore(path, fetch, "https://www.perplexity.ai/rest/computer/mcp").provider(), "SECRET");
+});
+
+test("login surfaces failing metadata and registration responses without secrets", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "pplx-"));
+  const quiet = { print: () => {}, path: join(dir, "c.json") };
+  const bad = (async () => new Response("SECRET", { status: 500 })) as unknown as typeof fetch;
+  await assert.rejects(login({ ...quiet, fetchImpl: bad }), (e: Error) => /metadata.*500/.test(e.message) && !/SECRET/.test(e.message));
+  const f = (async (u: string) =>
+    String(u).includes("well-known")
+      ? new Response(JSON.stringify({ registration_endpoint: "http://r", authorization_endpoint: "http://a", token_endpoint: "http://t" }))
+      : new Response("SECRET", { status: 403 })) as unknown as typeof fetch;
+  await assert.rejects(login({ ...quiet, fetchImpl: f }), (e: Error) => /registration.*403/.test(e.message) && !/SECRET/.test(e.message));
+});
+
+test("login redirect wait times out and closes the listener", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "pplx-"));
+  const f = (async (u: string) =>
+    String(u).includes("well-known")
+      ? new Response(JSON.stringify({ registration_endpoint: "http://r", authorization_endpoint: "http://a/auth", token_endpoint: "http://t" }))
+      : new Response(JSON.stringify({ client_id: "cid" }))) as unknown as typeof fetch;
+  let printed = "";
+  await assert.rejects(login({ fetchImpl: f, path: join(dir, "c.json"), timeoutMs: 30, print: (s) => (printed += s) }), /timed out/);
+  assert.ok(printed.includes("Open this URL"));
 });
