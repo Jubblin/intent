@@ -64,7 +64,7 @@ test("TokenStore refreshes expired token, rotates refresh token, saves 0600, ser
   delete process.env.PERPLEXITY_ACCESS_TOKEN;
   const dir = mkdtempSync(join(tmpdir(), "pplx-"));
   const path = join(dir, "c.json");
-  saveCredentials(path, { clientId: "cid", accessToken: "old", refreshToken: "r1", expiresAt: Date.now() - 1000, tokenEndpoint: "http://t/token" });
+  saveCredentials(path, { clientId: "cid", accessToken: "old", refreshToken: "r1", expiresAt: Date.now() - 1000, tokenEndpoint: "https://www.perplexity.ai/token" });
   let refreshes = 0;
   const f = (async (_u: string, init: any) => {
     refreshes++;
@@ -83,7 +83,7 @@ test("invalid_grant asks for re-login without leaking tokens", async () => {
   delete process.env.PERPLEXITY_ACCESS_TOKEN;
   const dir = mkdtempSync(join(tmpdir(), "pplx-"));
   const path = join(dir, "c.json");
-  saveCredentials(path, { clientId: "cid", accessToken: "SECRET", refreshToken: "RSECRET", expiresAt: 1, tokenEndpoint: "http://t" });
+  saveCredentials(path, { clientId: "cid", accessToken: "SECRET", refreshToken: "RSECRET", expiresAt: 1, tokenEndpoint: "https://www.perplexity.ai/token" });
   const f = (async () => new Response(JSON.stringify({ error: "invalid_grant" }), { status: 400 })) as unknown as typeof fetch;
   await assert.rejects(new TokenStore(path, f).provider(), (e: Error) => /login/.test(e.message) && !/SECRET/.test(e.message));
 });
@@ -138,4 +138,59 @@ test("login redirect wait times out and closes the listener", async () => {
   let printed = "";
   await assert.rejects(login({ fetchImpl: f, path: join(dir, "c.json"), timeoutMs: 30, print: (s) => (printed += s) }), /timed out/);
   assert.ok(printed.includes("Open this URL"));
+});
+
+test("login with a custom MCP URL uses it as resource and records its host", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "pplx-"));
+  const path = join(dir, "c.json");
+  const bodies: string[] = [];
+  const f = (async (u: string, init: any) => {
+    if (String(u).includes("well-known")) return new Response(JSON.stringify({ registration_endpoint: "http://r", authorization_endpoint: "http://a/auth", token_endpoint: "https://www.perplexity.ai/token" }));
+    if (String(u) === "http://r") return new Response(JSON.stringify({ client_id: "cid" }));
+    bodies.push(String(init.body));
+    return new Response(JSON.stringify({ access_token: "tok" }));
+  }) as unknown as typeof fetch;
+  let authUrl: URL | undefined;
+  await login({
+    fetchImpl: f,
+    path,
+    print: () => {},
+    mcpUrl: "https://mcp.example.com/mcp",
+    waitForCode: async (a) => {
+      authUrl = a;
+      return new URL(`http://127.0.0.1/callback?code=C&state=${a.searchParams.get("state")}`);
+    },
+  });
+  assert.equal(authUrl!.searchParams.get("resource"), "https://mcp.example.com/mcp");
+  assert.equal(new URLSearchParams(bodies[0]).get("resource"), "https://mcp.example.com/mcp");
+  assert.equal(loadCredentials(path)!.mcpHost, "mcp.example.com");
+});
+
+test("env token to a custom host needs explicit opt-in and the error omits the token", async () => {
+  process.env.PERPLEXITY_ACCESS_TOKEN = "ENVSECRET";
+  try {
+    delete process.env.PERPLEXITY_ALLOW_ENV_TOKEN_CUSTOM_HOST;
+    const s = new TokenStore("/nonexistent/c.json", fetch, "https://evil.example/mcp");
+    await assert.rejects(s.provider(), (e: Error) => /ALLOW_ENV_TOKEN_CUSTOM_HOST/.test(e.message) && !/ENVSECRET/.test(e.message));
+    process.env.PERPLEXITY_ALLOW_ENV_TOKEN_CUSTOM_HOST = "1";
+    assert.equal(await s.provider(), "ENVSECRET");
+    delete process.env.PERPLEXITY_ALLOW_ENV_TOKEN_CUSTOM_HOST;
+    assert.equal(await new TokenStore("/nonexistent/c.json").provider(), "ENVSECRET");
+  } finally {
+    delete process.env.PERPLEXITY_ACCESS_TOKEN;
+    delete process.env.PERPLEXITY_ALLOW_ENV_TOKEN_CUSTOM_HOST;
+  }
+});
+
+test("refresh refuses an untrusted tokenEndpoint from the credentials file", async () => {
+  delete process.env.PERPLEXITY_ACCESS_TOKEN;
+  for (const ep of ["http://www.perplexity.ai/token", "https://evil.example/token", "http://evil.example/token", "garbage"]) {
+    const dir = mkdtempSync(join(tmpdir(), "pplx-"));
+    const path = join(dir, "c.json");
+    saveCredentials(path, { clientId: "c", accessToken: "SECRET", refreshToken: "RSECRET", expiresAt: 1, tokenEndpoint: ep });
+    let called = false;
+    const f = (async () => ((called = true), new Response("{}"))) as unknown as typeof fetch;
+    await assert.rejects(new TokenStore(path, f).provider(), (e: Error) => /token endpoint/.test(e.message) && !/SECRET/.test(e.message));
+    assert.equal(called, false, ep);
+  }
 });

@@ -17,6 +17,7 @@ export type Credentials = {
   mcpHost?: string;
 };
 
+const DEFAULT_HOST = new URL(MCP_URL).host;
 const LOOPBACK = new Set(["localhost", "127.0.0.1", "::1", "[::1]"]);
 
 /** https only; http only for loopback hosts (tests, local mocks). Returns the parsed URL. */
@@ -94,7 +95,12 @@ export class TokenStore {
 
   provider = async (forceRefresh = false): Promise<string> => {
     const env = process.env.PERPLEXITY_ACCESS_TOKEN;
-    if (env) return env;
+    if (env) {
+      if (this.mcpHost !== DEFAULT_HOST && process.env.PERPLEXITY_ALLOW_ENV_TOKEN_CUSTOM_HOST !== "1") {
+        throw new Error(`Refusing to send PERPLEXITY_ACCESS_TOKEN to ${this.mcpHost}, which is not ${DEFAULT_HOST}. Set PERPLEXITY_ALLOW_ENV_TOKEN_CUSTOM_HOST=1 to allow it.`);
+      }
+      return env;
+    }
     if (this.inflight) return this.inflight;
     this.inflight = this.resolve(forceRefresh).finally(() => {
       this.inflight = undefined;
@@ -105,13 +111,14 @@ export class TokenStore {
   private async resolve(force: boolean): Promise<string> {
     const c = loadCredentials(this.path);
     if (!c) throw new Error("Not signed in. Run `login` (browser step required).");
-    const issuedFor = c.mcpHost ?? new URL(MCP_URL).host;
+    const issuedFor = c.mcpHost ?? DEFAULT_HOST;
     if (issuedFor !== this.mcpHost) {
       throw new Error(`Refusing to send the stored token to ${this.mcpHost}: it was issued for ${issuedFor}. Run \`login\` against that host or unset PERPLEXITY_MCP_URL.`);
     }
     const fresh = c.expiresAt === undefined || c.expiresAt - Date.now() > 60_000;
     if (fresh && !force) return c.accessToken;
     if (!c.refreshToken) throw new Error("Access token expired and no refresh token. Run `login` again.");
+    checkTokenEndpoint(c.tokenEndpoint, issuedFor);
     const res = await this.fetchImpl(c.tokenEndpoint, {
       method: "POST",
       headers: { "content-type": "application/x-www-form-urlencoded" },
@@ -137,6 +144,20 @@ export class TokenStore {
   }
 }
 
+/** The refresh token is only posted to https (or loopback http) on the host the credentials were issued for or the default issuer. */
+function checkTokenEndpoint(raw: unknown, issuedFor: string) {
+  const bad = () =>
+    new Error(`Refusing to refresh: the stored token endpoint is not trusted for ${issuedFor} (https on that host or ${DEFAULT_HOST} required). Run \`login\` again.`);
+  let u: URL;
+  try {
+    u = new URL(String(raw));
+  } catch {
+    throw bad();
+  }
+  const okScheme = u.protocol === "https:" || (u.protocol === "http:" && LOOPBACK.has(u.hostname));
+  if (!okScheme || (u.host !== issuedFor && u.host !== DEFAULT_HOST)) throw bad();
+}
+
 const b64url = (b: Buffer) => b.toString("base64url");
 
 /**
@@ -156,7 +177,7 @@ export async function login(
 ): Promise<void> {
   const f = opts.fetchImpl ?? fetch;
   const print = opts.print ?? ((s: string) => process.stderr.write(s + "\n"));
-  const mcpUrl = opts.mcpUrl ?? MCP_URL;
+  const mcpUrl = validateMcpUrl(opts.mcpUrl ?? MCP_URL).href;
   const timeoutMs = opts.timeoutMs ?? (Number(process.env.PERPLEXITY_ACP_LOGIN_TIMEOUT_MS) || 300_000);
   const metaRes = await f(ISSUER_META);
   if (!metaRes.ok) throw new Error(`OAuth metadata request failed (HTTP ${metaRes.status}).`);
@@ -195,7 +216,7 @@ export async function login(
       code_challenge: challenge,
       code_challenge_method: "S256",
       state,
-      resource: MCP_URL,
+      resource: mcpUrl,
     }).toString();
     print(`Open this URL in a browser to sign in:\n${auth}`);
     let timer: ReturnType<typeof setTimeout> | undefined;
@@ -229,7 +250,7 @@ export async function login(
         redirect_uri: redirect,
         client_id: reg.client_id,
         code_verifier: verifier,
-        resource: MCP_URL,
+        resource: mcpUrl,
       }),
     });
     const tok: any = await tokRes.json();

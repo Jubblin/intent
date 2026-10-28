@@ -3,16 +3,16 @@ import { MCP_URL, TokenStore, login, validateMcpUrl } from "./auth.ts";
 import { Peer } from "./jsonrpc.ts";
 import { McpClient } from "./mcp.ts";
 
+const mcpUrl = process.env.PERPLEXITY_MCP_URL ?? MCP_URL;
+try {
+  validateMcpUrl(mcpUrl);
+} catch (e: any) {
+  process.stderr.write(`${e.message}\n`);
+  process.exit(2);
+}
 if (process.argv[2] === "login") {
-  await login();
+  await login({ mcpUrl });
 } else {
-  const mcpUrl = process.env.PERPLEXITY_MCP_URL ?? MCP_URL;
-  try {
-    validateMcpUrl(mcpUrl);
-  } catch (e: any) {
-    process.stderr.write(`${e.message}\n`);
-    process.exit(2);
-  }
   const store = new TokenStore(undefined, fetch, mcpUrl);
   const peer = new Peer((l) => process.stdout.write(l + "\n"));
   const mcp = new McpClient(mcpUrl, store.provider);
