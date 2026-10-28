@@ -33,6 +33,23 @@ export function validateMcpUrl(raw: string): URL {
   throw new Error("PERPLEXITY_MCP_URL must use https (http is allowed only for localhost, 127.0.0.1 or ::1).");
 }
 
+/**
+ * fetch for any request that carries a bearer token, refresh token, or auth code: redirects are never
+ * followed (a 307/308 would re-send the body or header), and a 3xx answer is an error. Errors carry no secrets.
+ */
+export async function noRedirectFetch(f: typeof fetch, url: string | URL, init: RequestInit = {}): Promise<Response> {
+  let res: Response;
+  try {
+    res = await f(url, { ...init, redirect: "error" });
+  } catch {
+    throw new Error("Request failed or was redirected; redirects are refused for requests that carry credentials.");
+  }
+  if (res.status >= 300 && res.status < 400) {
+    throw new Error(`Refusing redirect (HTTP ${res.status}) on a request that carries credentials.`);
+  }
+  return res;
+}
+
 export function credentialsPath(): string {
   return (
     process.env.PERPLEXITY_ACP_CREDENTIALS ??
@@ -119,7 +136,7 @@ export class TokenStore {
     if (fresh && !force) return c.accessToken;
     if (!c.refreshToken) throw new Error("Access token expired and no refresh token. Run `login` again.");
     checkTokenEndpoint(c.tokenEndpoint, issuedFor);
-    const res = await this.fetchImpl(c.tokenEndpoint, {
+    const res = await noRedirectFetch(this.fetchImpl, c.tokenEndpoint, {
       method: "POST",
       headers: { "content-type": "application/x-www-form-urlencoded" },
       body: new URLSearchParams({
@@ -241,7 +258,7 @@ export async function login(
     if (url.searchParams.get("state") !== state) throw new Error("State mismatch.");
     const code = url.searchParams.get("code");
     if (!code) throw new Error(`Authorization failed: ${url.searchParams.get("error") ?? "no code"}`);
-    const tokRes = await f(meta.token_endpoint, {
+    const tokRes = await noRedirectFetch(f, meta.token_endpoint, {
       method: "POST",
       headers: { "content-type": "application/x-www-form-urlencoded" },
       body: new URLSearchParams({

@@ -194,3 +194,116 @@ test("refresh refuses an untrusted tokenEndpoint from the credentials file", asy
     assert.equal(called, false, ep);
   }
 });
+
+test("validateMcpUrl: userinfo, look-alike, uppercase, port and loopback rules", () => {
+  assert.throws(() => validateMcpUrl("http://good@evil.example/mcp"), /https/);
+  assert.equal(validateMcpUrl("https://good@evil.example/mcp").host, "evil.example");
+  assert.throws(() => validateMcpUrl("http://localhost@evil.example/mcp"), /https/);
+  assert.throws(() => validateMcpUrl("http://127.0.0.1.evil.example/mcp"), /https/);
+  assert.throws(() => validateMcpUrl("http://localhost.evil.example/mcp"), /https/);
+  assert.throws(() => validateMcpUrl("http://[::2]/mcp"), /https/);
+  assert.throws(() => validateMcpUrl("http://example.com:8080/mcp"), /https/);
+  validateMcpUrl("http://[::1]:8080/mcp");
+  validateMcpUrl("http://LOCALHOST:8080/mcp");
+  assert.equal(validateMcpUrl("https://WWW.PERPLEXITY.AI/mcp").host, "www.perplexity.ai");
+  assert.equal(validateMcpUrl("https://www.perplexity.ai:443/mcp").host, "www.perplexity.ai");
+  assert.equal(validateMcpUrl("https://www.perplexity.ai:8443/mcp").host, "www.perplexity.ai:8443");
+  assert.equal(validateMcpUrl("https://www.perplexity.ai.evil.example/mcp").host, "www.perplexity.ai.evil.example");
+});
+
+test("look-alike and non-default-port hosts do not receive the default host's stored token or env token", async () => {
+  delete process.env.PERPLEXITY_ACCESS_TOKEN;
+  const dir = mkdtempSync(join(tmpdir(), "pplx-"));
+  const path = join(dir, "c.json");
+  saveCredentials(path, { clientId: "c", accessToken: "SECRET", tokenEndpoint: "https://www.perplexity.ai/t" });
+  for (const u of ["https://www.perplexity.ai.evil.example/mcp", "https://www.perplexity.ai:8443/mcp", "https://good@evil.example/mcp"]) {
+    await assert.rejects(new TokenStore(path, fetch, u).provider(), (e: Error) => /issued for/.test(e.message) && !/SECRET/.test(e.message), u);
+  }
+  process.env.PERPLEXITY_ACCESS_TOKEN = "ENVSECRET";
+  try {
+    await assert.rejects(new TokenStore(path, fetch, "https://www.perplexity.ai:8443/mcp").provider(), (e: Error) => /ALLOW_ENV/.test(e.message) && !/ENVSECRET/.test(e.message));
+  } finally {
+    delete process.env.PERPLEXITY_ACCESS_TOKEN;
+  }
+});
+
+test("custom host works end to end: login, token bound to host, refresh", async () => {
+  delete process.env.PERPLEXITY_ACCESS_TOKEN;
+  const dir = mkdtempSync(join(tmpdir(), "pplx-"));
+  const path = join(dir, "c.json");
+  const mcpUrl = "https://mcp.example.com:8443/mcp";
+  const calls: { url: string; redirect?: string; body?: string }[] = [];
+  const f = (async (u: string, init: any) => {
+    calls.push({ url: String(u), redirect: init?.redirect, body: init?.body && String(init.body) });
+    if (String(u).includes("well-known")) return new Response(JSON.stringify({ registration_endpoint: "http://r", authorization_endpoint: "http://a/auth", token_endpoint: "https://mcp.example.com:8443/token" }));
+    if (String(u) === "http://r") return new Response(JSON.stringify({ client_id: "cid" }));
+    const grant = new URLSearchParams(init.body).get("grant_type");
+    return new Response(JSON.stringify(grant === "refresh_token" ? { access_token: "tok2", refresh_token: "r2", expires_in: 3600 } : { access_token: "tok1", refresh_token: "r1", expires_in: 1 }));
+  }) as unknown as typeof fetch;
+  await login({
+    fetchImpl: f,
+    path,
+    print: () => {},
+    mcpUrl,
+    waitForCode: async (a) => new URL(`http://127.0.0.1/callback?code=C&state=${a.searchParams.get("state")}`),
+  });
+  assert.equal(loadCredentials(path)!.mcpHost, "mcp.example.com:8443");
+  const store = new TokenStore(path, f, mcpUrl);
+  assert.equal(await store.provider(), "tok2");
+  assert.equal(loadCredentials(path)!.refreshToken, "r2");
+  const tokenCalls = calls.filter((c) => c.url === "https://mcp.example.com:8443/token");
+  assert.equal(tokenCalls.length, 2);
+  assert.ok(tokenCalls.every((c) => c.redirect === "error"));
+  await assert.rejects(new TokenStore(path, f, "https://other.example.com/mcp").provider(), /issued for/);
+});
+
+for (const status of [307, 308]) {
+  test(`token refresh POST answered with ${status} is refused and never re-sent`, async () => {
+    delete process.env.PERPLEXITY_ACCESS_TOKEN;
+    const hits: string[] = [];
+    const target = createServer((req, res) => {
+      hits.push("target");
+      req.resume();
+      res.end("{}");
+    });
+    await new Promise<void>((r) => target.listen(0, "127.0.0.1", r));
+    const tport = (target.address() as any).port;
+    const origin = createServer((req, res) => {
+      hits.push("origin");
+      req.resume();
+      res.statusCode = status;
+      res.setHeader("location", `http://127.0.0.1:${tport}/steal`);
+      res.end();
+    });
+    await new Promise<void>((r) => origin.listen(0, "127.0.0.1", r));
+    const oport = (origin.address() as any).port;
+    const dir = mkdtempSync(join(tmpdir(), "pplx-"));
+    const path = join(dir, "c.json");
+    const host = `127.0.0.1:${oport}`;
+    saveCredentials(path, { clientId: "c", accessToken: "old", refreshToken: "RSECRET", expiresAt: 1, tokenEndpoint: `http://${host}/token`, mcpHost: host });
+    try {
+      await assert.rejects(new TokenStore(path, fetch, `http://${host}/mcp`).provider(), (e: Error) => /redirect/i.test(e.message) && !/RSECRET/.test(e.message));
+      assert.deepEqual(hits, ["origin"]);
+    } finally {
+      target.close();
+      origin.close();
+      target.closeAllConnections?.();
+      origin.closeAllConnections?.();
+    }
+  });
+}
+
+test("a 3xx answer from an injected fetch is refused for token and MCP requests", async () => {
+  delete process.env.PERPLEXITY_ACCESS_TOKEN;
+  const dir = mkdtempSync(join(tmpdir(), "pplx-"));
+  const path = join(dir, "c.json");
+  saveCredentials(path, { clientId: "c", accessToken: "old", refreshToken: "RSECRET", expiresAt: 1, tokenEndpoint: "https://www.perplexity.ai/token" });
+  let redirectOpt: unknown;
+  const f = (async (_u: string, init: any) => {
+    redirectOpt = init.redirect;
+    return new Response(null, { status: 307, headers: { location: "https://evil.example/" } });
+  }) as unknown as typeof fetch;
+  await assert.rejects(new TokenStore(path, f).provider(), (e: Error) => /redirect/i.test(e.message) && !/RSECRET/.test(e.message));
+  assert.equal(redirectOpt, "error");
+  await assert.rejects(new McpClient("https://www.perplexity.ai/mcp", async () => "TOK", f).callTool("x", {}), (e: Error) => /redirect/i.test(e.message) && !/TOK/.test(e.message));
+});

@@ -1,5 +1,7 @@
 /** Minimal MCP client over streamable HTTP (JSON or SSE responses). Tokens are never logged. */
 
+import { noRedirectFetch } from "./auth.ts";
+
 export class McpAuthError extends Error {}
 
 export type TokenProvider = (forceRefresh?: boolean) => Promise<string>;
@@ -26,7 +28,7 @@ export class McpClient {
       authorization: `Bearer ${bearer}`,
     };
     if (this.session) headers["mcp-session-id"] = this.session;
-    const res = await this.fetchImpl(this.url, { method: "POST", headers, body: JSON.stringify(body) });
+    const res = await noRedirectFetch(this.fetchImpl, this.url, { method: "POST", headers, body: JSON.stringify(body) });
     if (res.status === 401) {
       if (!retried) return this.post(body, true);
       throw new McpAuthError("Perplexity rejected the credentials (401). Run `login` again.");
