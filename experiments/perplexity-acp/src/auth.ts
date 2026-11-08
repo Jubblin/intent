@@ -59,28 +59,29 @@ export function credentialsPath(): string {
 
 /** Atomic write, owner-only (0600). */
 export function saveCredentials(path: string, c: Credentials) {
-  mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
+  const created = mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
+  if (created) chmodSync(dirname(path), 0o700);
   const tmp = `${path}.${process.pid}.tmp`;
   writeFileSync(tmp, JSON.stringify(c), { mode: 0o600 });
   chmodSync(tmp, 0o600);
   renameSync(tmp, path);
 }
 
-/** Tighten a group/world-accessible credentials file (0600) and its directory (0700), or refuse. Never reads contents. */
+/** Tighten a group/world-accessible credentials file (0600), or refuse. Never reads contents. A pre-existing parent directory is only warned about, never chmodded. */
 function enforceModes(path: string) {
-  const fix = (p: string, want: number, what: string) => {
-    if ((statSync(p).mode & 0o077) === 0) return;
+  const bad = () => new Error(`Credentials file ${path} is accessible to other users and could not be tightened; fix its permissions.`);
+  if ((statSync(path).mode & 0o077) !== 0) {
     try {
-      chmodSync(p, want);
+      chmodSync(path, 0o600);
     } catch {
-      throw new Error(`Credentials ${what} ${p} is accessible to other users and could not be tightened; fix its permissions.`);
+      throw bad();
     }
-    if ((statSync(p).mode & 0o077) !== 0) {
-      throw new Error(`Credentials ${what} ${p} is accessible to other users and could not be tightened; fix its permissions.`);
-    }
-  };
-  fix(path, 0o600, "file");
-  fix(dirname(path), 0o700, "directory");
+    if ((statSync(path).mode & 0o077) !== 0) throw bad();
+  }
+  const dir = dirname(path);
+  if ((statSync(dir).mode & 0o077) !== 0) {
+    console.error(`perplexity-acp: warning: credentials directory ${dir} is accessible to other users; not changing it (file is 0600).`);
+  }
 }
 
 export function loadCredentials(path: string): Credentials | undefined {

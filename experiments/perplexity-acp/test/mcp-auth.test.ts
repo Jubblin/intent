@@ -88,7 +88,7 @@ test("invalid_grant asks for re-login without leaking tokens", async () => {
   await assert.rejects(new TokenStore(path, f).provider(), (e: Error) => /login/.test(e.message) && !/SECRET/.test(e.message));
 });
 
-test("loadCredentials tightens loose file and directory modes", () => {
+test("loadCredentials tightens a loose file but leaves the directory alone", () => {
   const dir = mkdtempSync(join(tmpdir(), "pplx-"));
   const path = join(dir, "c.json");
   saveCredentials(path, { clientId: "c", accessToken: "SECRET", tokenEndpoint: "http://t" });
@@ -96,7 +96,7 @@ test("loadCredentials tightens loose file and directory modes", () => {
   chmodSync(dir, 0o755);
   assert.equal(loadCredentials(path)!.accessToken, "SECRET");
   assert.equal(statSync(path).mode & 0o777, 0o600);
-  assert.equal(statSync(dir).mode & 0o777, 0o700);
+  assert.equal(statSync(dir).mode & 0o777, 0o755);
 });
 
 test("validateMcpUrl: https ok, http only loopback, junk refused", () => {
@@ -403,4 +403,26 @@ test("login refuses a discovered token_endpoint on another host before posting t
     );
     assert.deepEqual(posted, []);
   }
+});
+
+test("a pre-existing parent directory is not chmodded on load; file is tightened", () => {
+  const dir = mkdtempSync(join(tmpdir(), "pplx-"));
+  chmodSync(dir, 0o755);
+  const path = join(dir, "c.json");
+  saveCredentials(path, { clientId: "c", accessToken: "t", tokenEndpoint: "http://t", mcpHost: "h" });
+  chmodSync(path, 0o644);
+  chmodSync(dir, 0o755);
+  loadCredentials(path);
+  assert.equal(statSync(dir).mode & 0o777, 0o755);
+  assert.equal(statSync(path).mode & 0o777, 0o600);
+});
+
+test("saveCredentials does not chmod a pre-existing directory but locks one it creates", () => {
+  const dir = mkdtempSync(join(tmpdir(), "pplx-"));
+  chmodSync(dir, 0o755);
+  saveCredentials(join(dir, "c.json"), { clientId: "c", accessToken: "t", tokenEndpoint: "http://t", mcpHost: "h" });
+  assert.equal(statSync(dir).mode & 0o777, 0o755);
+  const fresh = join(dir, "new");
+  saveCredentials(join(fresh, "c.json"), { clientId: "c", accessToken: "t", tokenEndpoint: "http://t", mcpHost: "h" });
+  assert.equal(statSync(fresh).mode & 0o777, 0o700);
 });
