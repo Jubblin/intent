@@ -1,5 +1,5 @@
 import { createHash, randomBytes } from "node:crypto";
-import { chmodSync, existsSync, mkdirSync, readFileSync, renameSync, statSync, writeFileSync } from "node:fs";
+import { chmodSync, closeSync, existsSync, mkdirSync, openSync, readFileSync, renameSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import { createServer } from "node:http";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
@@ -28,6 +28,7 @@ export function validateMcpUrl(raw: string): URL {
   } catch {
     throw new Error("PERPLEXITY_MCP_URL is not a valid URL.");
   }
+  if (u.username || u.password) throw new Error("PERPLEXITY_MCP_URL must not contain a username or password.");
   if (u.protocol === "https:") return u;
   if (u.protocol === "http:" && LOOPBACK.has(u.hostname)) return u;
   throw new Error("PERPLEXITY_MCP_URL must use https (http is allowed only for localhost, 127.0.0.1 or ::1).");
@@ -61,10 +62,23 @@ export function credentialsPath(): string {
 export function saveCredentials(path: string, c: Credentials) {
   const created = mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
   if (created) chmodSync(dirname(path), 0o700);
-  const tmp = `${path}.${process.pid}.tmp`;
-  writeFileSync(tmp, JSON.stringify(c), { mode: 0o600 });
-  chmodSync(tmp, 0o600);
-  renameSync(tmp, path);
+  const tmp = `${path}.${process.pid}.${randomBytes(8).toString("hex")}.tmp`;
+  // "wx" = O_CREAT|O_EXCL: fails on any pre-existing path, including a symlink.
+  const fd = openSync(tmp, "wx", 0o600);
+  try {
+    try {
+      writeFileSync(fd, JSON.stringify(c));
+    } finally {
+      closeSync(fd);
+    }
+    chmodSync(tmp, 0o600);
+    renameSync(tmp, path);
+  } catch (e) {
+    try {
+      unlinkSync(tmp);
+    } catch {}
+    throw e;
+  }
 }
 
 /** Tighten a group/world-accessible credentials file (0600), or refuse. Never reads contents. A pre-existing parent directory is only warned about, never chmodded. */
