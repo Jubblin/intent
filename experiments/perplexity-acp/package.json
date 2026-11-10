@@ -1,0 +1,20 @@
+{
+  "name": "perplexity-acp-experiment",
+  "version": "0.0.0",
+  "private": true,
+  "description": "EXPERIMENTAL, UNSHIPPED: ACP adapter over the Perplexity Computer MCP server. Terms of use unclear; do not publish.",
+  "type": "module",
+  "engines": {
+    "node": ">=22.6"
+  },
+  "scripts": {
+    "test": "node --import tsx --test test/*.test.ts",
+    "start": "node --import tsx src/cli.ts",
+    "login": "node --import tsx src/cli.ts login"
+  },
+  "devDependencies": {
+    "@types/node": "^26.6.5",
+    "tsx": "^4.23.15",
+    "typescript": "^7.0.2"
+  }
+}
