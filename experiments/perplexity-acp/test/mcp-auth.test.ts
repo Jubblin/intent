@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { chmodSync, mkdtempSync, statSync } from "node:fs";
+import { chmodSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { createServer } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -88,7 +88,7 @@ test("invalid_grant asks for re-login without leaking tokens", async () => {
   await assert.rejects(new TokenStore(path, f).provider(), (e: Error) => /login/.test(e.message) && !/SECRET/.test(e.message));
 });
 
-test("loadCredentials tightens loose file and directory modes", () => {
+test("loadCredentials tightens a loose file but leaves the directory alone", () => {
   const dir = mkdtempSync(join(tmpdir(), "pplx-"));
   const path = join(dir, "c.json");
   saveCredentials(path, { clientId: "c", accessToken: "SECRET", tokenEndpoint: "http://t" });
@@ -96,7 +96,7 @@ test("loadCredentials tightens loose file and directory modes", () => {
   chmodSync(dir, 0o755);
   assert.equal(loadCredentials(path)!.accessToken, "SECRET");
   assert.equal(statSync(path).mode & 0o777, 0o600);
-  assert.equal(statSync(dir).mode & 0o777, 0o700);
+  assert.equal(statSync(dir).mode & 0o777, 0o755);
 });
 
 test("validateMcpUrl: https ok, http only loopback, junk refused", () => {
@@ -196,9 +196,9 @@ test("refresh refuses an untrusted tokenEndpoint from the credentials file", asy
 });
 
 test("validateMcpUrl: userinfo, look-alike, uppercase, port and loopback rules", () => {
-  assert.throws(() => validateMcpUrl("http://good@evil.example/mcp"), /https/);
-  assert.equal(validateMcpUrl("https://good@evil.example/mcp").host, "evil.example");
-  assert.throws(() => validateMcpUrl("http://localhost@evil.example/mcp"), /https/);
+  assert.throws(() => validateMcpUrl("http://good@evil.example/mcp"), /username or password/);
+  assert.throws(() => validateMcpUrl("https://good@evil.example/mcp"), /username or password/);
+  assert.throws(() => validateMcpUrl("http://localhost@evil.example/mcp"), /username or password/);
   assert.throws(() => validateMcpUrl("http://127.0.0.1.evil.example/mcp"), /https/);
   assert.throws(() => validateMcpUrl("http://localhost.evil.example/mcp"), /https/);
   assert.throws(() => validateMcpUrl("http://[::2]/mcp"), /https/);
@@ -216,7 +216,7 @@ test("look-alike and non-default-port hosts do not receive the default host's st
   const dir = mkdtempSync(join(tmpdir(), "pplx-"));
   const path = join(dir, "c.json");
   saveCredentials(path, { clientId: "c", accessToken: "SECRET", tokenEndpoint: "https://www.perplexity.ai/t" });
-  for (const u of ["https://www.perplexity.ai.evil.example/mcp", "https://www.perplexity.ai:8443/mcp", "https://good@evil.example/mcp"]) {
+  for (const u of ["https://www.perplexity.ai.evil.example/mcp", "https://www.perplexity.ai:8443/mcp"]) {
     await assert.rejects(new TokenStore(path, fetch, u).provider(), (e: Error) => /issued for/.test(e.message) && !/SECRET/.test(e.message), u);
   }
   process.env.PERPLEXITY_ACCESS_TOKEN = "ENVSECRET";
@@ -403,4 +403,55 @@ test("login refuses a discovered token_endpoint on another host before posting t
     );
     assert.deepEqual(posted, []);
   }
+});
+
+test("a pre-existing parent directory is not chmodded on load; file is tightened", () => {
+  const dir = mkdtempSync(join(tmpdir(), "pplx-"));
+  chmodSync(dir, 0o755);
+  const path = join(dir, "c.json");
+  saveCredentials(path, { clientId: "c", accessToken: "t", tokenEndpoint: "http://t", mcpHost: "h" });
+  chmodSync(path, 0o644);
+  chmodSync(dir, 0o755);
+  loadCredentials(path);
+  assert.equal(statSync(dir).mode & 0o777, 0o755);
+  assert.equal(statSync(path).mode & 0o777, 0o600);
+});
+
+test("saveCredentials does not chmod a pre-existing directory but locks one it creates", () => {
+  const dir = mkdtempSync(join(tmpdir(), "pplx-"));
+  chmodSync(dir, 0o755);
+  saveCredentials(join(dir, "c.json"), { clientId: "c", accessToken: "t", tokenEndpoint: "http://t", mcpHost: "h" });
+  assert.equal(statSync(dir).mode & 0o777, 0o755);
+  const fresh = join(dir, "new");
+  saveCredentials(join(fresh, "c.json"), { clientId: "c", accessToken: "t", tokenEndpoint: "http://t", mcpHost: "h" });
+  assert.equal(statSync(fresh).mode & 0o777, 0o700);
+});
+
+test("validateMcpUrl: userinfo refused without echoing the password", () => {
+  for (const u of ["https://user:hunter2@www.perplexity.ai/mcp", "https://user@www.perplexity.ai/mcp", "http://:hunter2@127.0.0.1/mcp"]) {
+    assert.throws(
+      () => validateMcpUrl(u),
+      (e: any) => /username or password/.test(e.message) && !e.message.includes("hunter2"),
+    );
+  }
+});
+
+test("saveCredentials: failed rename removes the tmp file", () => {
+  const dir = mkdtempSync(join(tmpdir(), "ppx-"));
+  const path = join(dir, "creds.json");
+  mkdirSync(join(path, "blocker"), { recursive: true });
+  assert.throws(() => saveCredentials(path, { clientId: "c", accessToken: "SECRET", tokenEndpoint: "https://t" }));
+  assert.deepEqual(readdirSync(dir), ["creds.json"]);
+});
+
+test("saveCredentials: ignores a pre-existing or symlinked predictable tmp path", () => {
+  const dir = mkdtempSync(join(tmpdir(), "ppx-"));
+  const path = join(dir, "creds.json");
+  const victim = join(dir, "victim");
+  writeFileSync(victim, "keep");
+  symlinkSync(victim, `${path}.${process.pid}.tmp`);
+  saveCredentials(path, { clientId: "c", accessToken: "SECRET", tokenEndpoint: "https://t" });
+  assert.equal(readFileSync(victim, "utf8"), "keep");
+  assert.equal(loadCredentials(path)?.accessToken, "SECRET");
+  assert.equal(statSync(path).mode & 0o777, 0o600);
 });

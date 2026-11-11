@@ -181,7 +181,7 @@ export class PerplexityAgent {
       // Fail closed: an errored, rejected or timed-out permission request is a DENY, never an approval.
       s.cancelled = true;
       try {
-        await this.mcp.callTool(i.deny_with_tool ?? "confirm_action_deny", { ...args, result: "Denied: permission request failed or timed out" });
+        await this.mcp.callTool("confirm_action_deny", { ...args, result: "Denied: permission request failed or timed out" });
       } catch {}
       await this.backendCancel(s);
       throw new RpcFailure(-32000, `Permission request failed (${e?.message ?? e}); the action was denied and the task cancelled.`);
@@ -191,8 +191,8 @@ export class PerplexityAgent {
       s.cancelled = true;
       return "cancelled";
     }
-    if (selected === "approve") return this.mcp.callTool(i.approve_with_tool ?? "confirm_action_approve", args);
-    return this.mcp.callTool(i.deny_with_tool ?? "confirm_action_deny", { ...args, result: "Denied by user in ACP client" });
+    if (selected === "approve") return this.mcp.callTool("confirm_action_approve", args);
+    return this.mcp.callTool("confirm_action_deny", { ...args, result: "Denied by user in ACP client" });
   }
 
   private async poll(s: Session): Promise<"cancelled" | { status: string; text: string } | { confirm: any }> {
